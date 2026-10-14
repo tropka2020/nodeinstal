@@ -3,9 +3,11 @@
 set -Eeuo pipefail
 
 NODE_DIR="/opt/remnanode"
-LOG_DIR="/var/log/remnanode"
 COMPOSE_FILE="${NODE_DIR}/docker-compose.yml"
+
+LOG_DIR="/var/log/remnanode"
 LOGROTATE_FILE="/etc/logrotate.d/remnanode"
+
 SELFSTEAL_SCRIPT="/tmp/selfsteal.sh"
 
 trap 'echo; echo "[ERROR] Ошибка в строке ${LINENO}"; exit 1' ERR
@@ -13,6 +15,11 @@ trap 'echo; echo "[ERROR] Ошибка в строке ${LINENO}"; exit 1' ERR
 log() {
     echo
     echo "[INFO] $*"
+}
+
+warn() {
+    echo
+    echo "[WARN] $*"
 }
 
 die() {
@@ -25,22 +32,6 @@ require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
         die "Запустите скрипт от root или через sudo."
     fi
-}
-
-check_ip() {
-    local ip="$1"
-
-    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-
-    IFS='.' read -r a b c d <<< "${ip}"
-
-    for octet in "$a" "$b" "$c" "$d"; do
-        (( octet >= 0 && octet <= 255 )) || return 1
-    done
-}
-
-check_domain() {
-    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
 }
 
 check_os() {
@@ -56,74 +47,109 @@ check_os() {
             log "Операционная система: ${PRETTY_NAME}"
             ;;
         *)
-            die "Поддерживаются Ubuntu и Debian."
+            die "Поддерживаются только Ubuntu и Debian."
             ;;
     esac
 }
 
+check_ipv4() {
+    local ip="$1"
+
+    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+    IFS='.' read -r octet1 octet2 octet3 octet4 <<< "${ip}"
+
+    for octet in "${octet1}" "${octet2}" "${octet3}" "${octet4}"; do
+        if (( octet < 0 || octet > 255 )); then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+check_domain() {
+    local domain="$1"
+
+    [[ "${domain}" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
+}
+
 collect_settings() {
     echo
-    echo "===== Настройка Remnawave Node ====="
+    echo "=============================================="
+    echo "Настройка Remnawave Node"
+    echo "=============================================="
     echo
 
     while true; do
-        read -r -p "IP-адрес панели Remnawave: " PANEL_IP
+        read -r -p "Введите IP-адрес панели Remnawave: " PANEL_IP
 
-        if check_ip "${PANEL_IP}"; then
+        if check_ipv4 "${PANEL_IP}"; then
             break
         fi
 
-        echo "Некорректный IPv4-адрес."
+        echo "Ошибка: указан некорректный IPv4-адрес."
     done
 
     while true; do
-        read -r -s -p "SECRET_KEY ноды: " NODE_SECRET_KEY
+        read -r -s -p "Введите SECRET_KEY ноды: " NODE_SECRET_KEY
         echo
 
-        if [[ -n "${NODE_SECRET_KEY}" ]]; then
-            break
+        if [[ -z "${NODE_SECRET_KEY}" ]]; then
+            echo "Ошибка: SECRET_KEY не может быть пустым."
+            continue
         fi
 
-        echo "SECRET_KEY не может быть пустым."
+        if [[ "${NODE_SECRET_KEY}" =~ [[:space:]] ]]; then
+            echo "Ошибка: SECRET_KEY не должен содержать пробелы."
+            continue
+        fi
+
+        break
     done
 
     echo
-    echo "===== Настройка Selfsteal Caddy ====="
+    echo "=============================================="
+    echo "Настройка Selfsteal Caddy"
+    echo "=============================================="
     echo
 
     while true; do
-        read -r -p "Домен Selfsteal, направленный на этот сервер: " SELFSTEAL_DOMAIN
+        read -r -p "Введите домен Selfsteal: " SELFSTEAL_DOMAIN
 
         if check_domain "${SELFSTEAL_DOMAIN}"; then
             break
         fi
 
-        echo "Некорректное доменное имя."
+        echo "Ошибка: указан некорректный домен."
     done
 
     echo
-    echo "Будет настроено:"
-    echo "  Panel IP:          ${PANEL_IP}"
-    echo "  Node API port:     2222/tcp"
-    echo "  Selfsteal:         Caddy"
-    echo "  Selfsteal domain:  ${SELFSTEAL_DOMAIN}"
-    echo "  Node logs:         ${LOG_DIR}"
+    echo "Проверьте параметры:"
+    echo
+    echo "  IP панели:          ${PANEL_IP}"
+    echo "  Node API port:      2222"
+    echo "  Selfsteal:          Caddy"
+    echo "  Домен Selfsteal:    ${SELFSTEAL_DOMAIN}"
+    echo "  Каталог логов:      ${LOG_DIR}"
     echo
 
-    read -r -p "Продолжить установку? [y/N]: " answer
+    read -r -p "Начать установку? [y/N]: " confirmation
 
-    if [[ "${answer,,}" != "y" ]]; then
+    if [[ "${confirmation,,}" != "y" ]]; then
         echo "Установка отменена."
         exit 0
     fi
 }
 
-install_packages() {
-    log "Установка необходимых пакетов"
+install_required_packages() {
+    log "Обновление списка пакетов"
 
     export DEBIAN_FRONTEND=noninteractive
 
     apt-get update
+
+    log "Установка необходимых пакетов"
 
     apt-get install -y \
         ca-certificates \
@@ -149,8 +175,9 @@ install_docker() {
 
     systemctl enable --now docker
 
-    docker compose version >/dev/null 2>&1 ||
-        die "Docker Compose plugin не установлен."
+    if ! docker compose version >/dev/null 2>&1; then
+        die "Docker Compose Plugin не установлен или недоступен."
+    fi
 }
 
 prepare_directories() {
@@ -163,8 +190,8 @@ prepare_directories() {
     chmod 755 "${LOG_DIR}"
 }
 
-write_node_compose() {
-    log "Создание ${COMPOSE_FILE}"
+create_node_compose() {
+    log "Создание Docker Compose для Remnawave Node"
 
     cat > "${COMPOSE_FILE}" <<EOF
 services:
@@ -188,19 +215,26 @@ services:
 EOF
 
     chmod 600 "${COMPOSE_FILE}"
+
+    log "Создан файл:"
+    echo "${COMPOSE_FILE}"
 }
 
 configure_ufw() {
     log "Настройка UFW"
 
-    # Сначала разрешаем SSH, чтобы не потерять доступ.
+    # Сначала разрешаем SSH, чтобы не потерять доступ к серверу.
     ufw allow 22/tcp comment "SSH"
 
-    # Порты Caddy и ACME.
+    # Порты Caddy и получения SSL-сертификата.
     ufw allow 80/tcp comment "HTTP"
     ufw allow 443/tcp comment "HTTPS"
 
-    # API ноды доступен только панели.
+    # Удаляем возможное общее разрешение 2222, если оно было добавлено ранее.
+    ufw delete allow 2222/tcp >/dev/null 2>&1 || true
+    ufw delete allow 2222 >/dev/null 2>&1 || true
+
+    # Node API доступен только с IP панели.
     ufw allow from "${PANEL_IP}" \
         to any port 2222 \
         proto tcp \
@@ -212,11 +246,15 @@ configure_ufw() {
     ufw --force enable
     ufw reload
 
+    echo
+    echo "Текущие правила UFW:"
     ufw status numbered
 }
 
 configure_logrotate() {
-    log "Настройка logrotate"
+    log "Создание конфигурации logrotate"
+
+    mkdir -p "${LOG_DIR}"
 
     cat > "${LOGROTATE_FILE}" <<'EOF'
 /var/log/remnanode/*.log {
@@ -231,18 +269,25 @@ EOF
 
     chmod 644 "${LOGROTATE_FILE}"
 
+    log "Проверка конфигурации logrotate"
+
     logrotate -d "${LOGROTATE_FILE}" >/dev/null
 
-    log "Конфигурация logrotate проверена"
+    log "Принудительный тестовый запуск logrotate"
+
+    logrotate -vf "${LOGROTATE_FILE}"
 }
 
-start_node() {
-    log "Запуск Remnawave Node"
+start_remnanode() {
+    log "Загрузка образа Remnawave Node"
 
     cd "${NODE_DIR}"
 
     docker compose pull
-    docker compose up -d
+
+    log "Запуск Remnawave Node"
+
+    docker compose up -d --force-recreate
 
     sleep 5
 
@@ -258,7 +303,7 @@ install_selfsteal_caddy() {
 
     chmod 700 "${SELFSTEAL_SCRIPT}"
 
-    log "Установка Selfsteal на Caddy"
+    log "Установка Selfsteal в режиме Caddy"
 
     bash "${SELFSTEAL_SCRIPT}" @ \
         --force \
@@ -266,8 +311,8 @@ install_selfsteal_caddy() {
         install
 }
 
-restart_node_after_selfsteal() {
-    log "Перезапуск Remnawave Node"
+restart_remnanode() {
+    log "Повторный запуск Remnawave Node"
 
     cd "${NODE_DIR}"
 
@@ -280,32 +325,50 @@ show_result() {
     echo "Установка завершена"
     echo "=============================================="
     echo
-    echo "Node Compose:"
+
+    echo "Docker Compose ноды:"
     echo "  ${COMPOSE_FILE}"
     echo
-    echo "Логи Node:"
+
+    echo "Каталог логов:"
     echo "  ${LOG_DIR}"
     echo
-    echo "Проверка Node:"
+
+    echo "Конфигурация logrotate:"
+    echo "  ${LOGROTATE_FILE}"
+    echo
+
+    echo "Проверка контейнера:"
+    echo "  docker ps"
+    echo
+
+    echo "Логи Remnawave Node:"
     echo "  docker logs remnanode --tail 100"
     echo
-    echo "Проверка Selfsteal:"
+
+    echo "Статус Selfsteal:"
     echo "  selfsteal status"
     echo
+
     echo "Логи Selfsteal:"
     echo "  selfsteal logs"
     echo
+
     echo "Проверка портов:"
     echo "  ss -lntp | grep -E ':80|:443|:2222|:9443'"
     echo
-    echo "Проверка logrotate:"
-    echo "  logrotate -vf /etc/logrotate.d/remnanode"
+
+    echo "Проверка логов внутри контейнера:"
+    echo "  docker exec remnanode ls -la /var/log/remnanode"
     echo
+
     echo "Проверка UFW:"
     echo "  ufw status numbered"
     echo
-    echo "Теперь добавьте Node в панели Remnawave."
-    echo "Node Port: 2222"
+
+    echo "Теперь добавьте Node в панели Remnawave:"
+    echo "  Node Address: IP или домен этого сервера"
+    echo "  Node Port:    2222"
     echo
 }
 
@@ -313,15 +376,15 @@ main() {
     require_root
     check_os
     collect_settings
-    install_packages
+    install_required_packages
     install_docker
     prepare_directories
-    write_node_compose
+    create_node_compose
     configure_ufw
     configure_logrotate
-    start_node
+    start_remnanode
     install_selfsteal_caddy
-    restart_node_after_selfsteal
+    restart_remnanode
     show_result
 }
 
